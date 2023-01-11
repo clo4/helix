@@ -25,3 +25,6 @@ lto = "fat"
 codegen-units = 1
 # strip = "debuginfo" # TODO: or strip = true
 opt-level = 3
+
+[patch.crates-io]
+crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3fe13e18d8cf7a8ff18300e39c79b8d24d3dcb63" }
