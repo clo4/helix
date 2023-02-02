@@ -6,9 +6,9 @@ use crate::{
     keymap::{KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer, TranslatedPosition},
-        Completion, ProgressSpinners,
+        overlay::Overlay,
+        Completion, Explorer, ProgressSpinners,
     },
-    ui::{overlay::Overlay, Completion, Explorer, ProgressSpinners},
 };
 
 use helix_core::{
@@ -1363,7 +1363,6 @@ impl Component for EditorView {
         }
 
         // if the terminal size suddenly changed, we need to trigger a resize
-        let mut editor_area = area.clip_bottom(1);
         if self.explorer.is_some() && (config.explorer.is_embed()) {
             editor_area = editor_area.clip_left(config.explorer.column_width as u16 + 2);
         }
