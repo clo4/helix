@@ -9,7 +9,8 @@ pub use lsp::{Position, Url};
 pub use lsp_types as lsp;
 
 use futures_util::stream::select_all::SelectAll;
-use helix_core::syntax::LanguageConfiguration;
+use helix_core::syntax::{LanguageConfiguration, LanguageServerConfiguration};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -38,8 +39,6 @@ pub enum Error {
     Timeout,
     #[error("server closed the stream")]
     StreamClosed,
-    #[error("LSP not defined")]
-    LspNotDefined,
     #[error("Unhandled")]
     Unhandled,
     #[error(transparent)]
@@ -58,7 +57,7 @@ pub enum OffsetEncoding {
 
 pub mod util {
     use super::*;
-    use helix_core::{diagnostic::NumberOrString, Range, Rope, Transaction};
+    use helix_core::{diagnostic::NumberOrString, Range, Rope, Selection, Tendril, Transaction};
 
     /// Converts a diagnostic in the document to [`lsp::Diagnostic`].
     ///
@@ -86,16 +85,34 @@ pub mod util {
             None => None,
         };
 
-        // TODO: add support for Diagnostic.data
-        lsp::Diagnostic::new(
-            range_to_lsp_range(doc, range, offset_encoding),
+        let new_tags: Vec<_> = diag
+            .tags
+            .iter()
+            .map(|tag| match tag {
+                helix_core::diagnostic::DiagnosticTag::Unnecessary => {
+                    lsp::DiagnosticTag::UNNECESSARY
+                }
+                helix_core::diagnostic::DiagnosticTag::Deprecated => lsp::DiagnosticTag::DEPRECATED,
+            })
+            .collect();
+
+        let tags = if !new_tags.is_empty() {
+            Some(new_tags)
+        } else {
+            None
+        };
+
+        lsp::Diagnostic {
+            range: range_to_lsp_range(doc, range, offset_encoding),
             severity,
             code,
-            None,
-            diag.message.to_owned(),
-            None,
-            None,
-        )
+            source: diag.source.clone(),
+            message: diag.message.to_owned(),
+            related_information: None,
+            tags,
+            data: diag.data.to_owned(),
+            ..Default::default()
+        }
     }
 
     /// Converts [`lsp::Position`] to a position in the document.
@@ -179,6 +196,42 @@ pub mod util {
         Some(Range::new(start, end))
     }
 
+    /// Creates a [Transaction] from the [lsp::TextEdit] in a completion response.
+    /// The transaction applies the edit to all cursors.
+    pub fn generate_transaction_from_completion_edit(
+        doc: &Rope,
+        selection: &Selection,
+        edit: lsp::TextEdit,
+        offset_encoding: OffsetEncoding,
+    ) -> Transaction {
+        let replacement: Option<Tendril> = if edit.new_text.is_empty() {
+            None
+        } else {
+            Some(edit.new_text.into())
+        };
+
+        let text = doc.slice(..);
+        let primary_cursor = selection.primary().cursor(text);
+
+        let start_offset = match lsp_pos_to_pos(doc, edit.range.start, offset_encoding) {
+            Some(start) => start as i128 - primary_cursor as i128,
+            None => return Transaction::new(doc),
+        };
+        let end_offset = match lsp_pos_to_pos(doc, edit.range.end, offset_encoding) {
+            Some(end) => end as i128 - primary_cursor as i128,
+            None => return Transaction::new(doc),
+        };
+
+        Transaction::change_by_selection(doc, selection, |range| {
+            let cursor = range.cursor(text);
+            (
+                (cursor as i128 + start_offset) as usize,
+                (cursor as i128 + end_offset) as usize,
+                replacement.clone(),
+            )
+        })
+    }
+
     pub fn generate_transaction_from_edits(
         doc: &Rope,
         mut edits: Vec<lsp::TextEdit>,
@@ -187,6 +240,20 @@ pub mod util {
         // Sort edits by start range, since some LSPs (Omnisharp) send them
         // in reverse order.
         edits.sort_unstable_by_key(|edit| edit.range.start);
+
+        // Generate a diff if the edit is a full document replacement.
+        #[allow(clippy::collapsible_if)]
+        if edits.len() == 1 {
+            let is_document_replacement = edits.first().and_then(|edit| {
+                let start = lsp_pos_to_pos(doc, edit.range.start, offset_encoding)?;
+                let end = lsp_pos_to_pos(doc, edit.range.end, offset_encoding)?;
+                Some(start..end)
+            }) == Some(0..doc.len_chars());
+            if is_document_replacement {
+                let new_text = Rope::from(edits.pop().unwrap().new_text);
+                return helix_core::diff::compare_ropes(doc, &new_text);
+            }
+        }
 
         Transaction::change(
             doc,
@@ -252,6 +319,8 @@ impl MethodCall {
 pub enum Notification {
     // we inject this notification to signal the LSP is ready
     Initialized,
+    // and this notification to signal that the LSP exited
+    Exit,
     PublishDiagnostics(lsp::PublishDiagnosticsParams),
     ShowMessage(lsp::ShowMessageParams),
     LogMessage(lsp::LogMessageParams),
@@ -264,6 +333,7 @@ impl Notification {
 
         let notification = match method {
             lsp::notification::Initialized::METHOD => Self::Initialized,
+            lsp::notification::Exit::METHOD => Self::Exit,
             lsp::notification::PublishDiagnostics::METHOD => {
                 let params: lsp::PublishDiagnosticsParams = params.parse()?;
                 Self::PublishDiagnostics(params)
@@ -320,57 +390,65 @@ impl Registry {
             .map(|(_, client)| client.as_ref())
     }
 
-    pub fn get(&mut self, language_config: &LanguageConfiguration) -> Result<Arc<Client>> {
+    pub fn remove_by_id(&mut self, id: usize) {
+        self.inner.retain(|_, (client_id, _)| client_id != &id)
+    }
+
+    pub fn restart(
+        &mut self,
+        language_config: &LanguageConfiguration,
+        doc_path: Option<&std::path::PathBuf>,
+    ) -> Result<Option<Arc<Client>>> {
         let config = match &language_config.language_server {
             Some(config) => config,
-            None => return Err(Error::LspNotDefined),
+            None => return Ok(None),
+        };
+
+        let scope = language_config.scope.clone();
+
+        match self.inner.entry(scope) {
+            Entry::Vacant(_) => Ok(None),
+            Entry::Occupied(mut entry) => {
+                // initialize a new client
+                let id = self.counter.fetch_add(1, Ordering::Relaxed);
+
+                let NewClientResult(client, incoming) =
+                    start_client(id, language_config, config, doc_path)?;
+                self.incoming.push(UnboundedReceiverStream::new(incoming));
+
+                let (_, old_client) = entry.insert((id, client.clone()));
+
+                tokio::spawn(async move {
+                    let _ = old_client.force_shutdown().await;
+                });
+
+                Ok(Some(client))
+            }
+        }
+    }
+
+    pub fn get(
+        &mut self,
+        language_config: &LanguageConfiguration,
+        doc_path: Option<&std::path::PathBuf>,
+    ) -> Result<Option<Arc<Client>>> {
+        let config = match &language_config.language_server {
+            Some(config) => config,
+            None => return Ok(None),
         };
 
         match self.inner.entry(language_config.scope.clone()) {
-            Entry::Occupied(entry) => Ok(entry.get().1.clone()),
+            Entry::Occupied(entry) => Ok(Some(entry.get().1.clone())),
             Entry::Vacant(entry) => {
                 // initialize a new client
                 let id = self.counter.fetch_add(1, Ordering::Relaxed);
-                let (client, incoming, initialize_notify) = Client::start(
-                    &config.command,
-                    &config.args,
-                    language_config.config.clone(),
-                    &language_config.roots,
-                    id,
-                    config.timeout,
-                )?;
+
+                let NewClientResult(client, incoming) =
+                    start_client(id, language_config, config, doc_path)?;
                 self.incoming.push(UnboundedReceiverStream::new(incoming));
-                let client = Arc::new(client);
-
-                // Initialize the client asynchronously
-                let _client = client.clone();
-                tokio::spawn(async move {
-                    use futures_util::TryFutureExt;
-                    let value = _client
-                        .capabilities
-                        .get_or_try_init(|| {
-                            _client
-                                .initialize()
-                                .map_ok(|response| response.capabilities)
-                        })
-                        .await;
-
-                    if let Err(e) = value {
-                        log::error!("failed to initialize language server: {}", e);
-                        return;
-                    }
-
-                    // next up, notify<initialized>
-                    _client
-                        .notify::<lsp::notification::Initialized>(lsp::InitializedParams {})
-                        .await
-                        .unwrap();
-
-                    initialize_notify.notify_one();
-                });
 
                 entry.insert((id, client.clone()));
-                Ok(client)
+                Ok(Some(client))
             }
         }
     }
@@ -456,6 +534,59 @@ impl LspProgressMap {
             .or_default()
             .insert(token, ProgressStatus::Started(status))
     }
+}
+
+struct NewClientResult(Arc<Client>, UnboundedReceiver<(usize, Call)>);
+
+/// start_client takes both a LanguageConfiguration and a LanguageServerConfiguration to ensure that
+/// it is only called when it makes sense.
+fn start_client(
+    id: usize,
+    config: &LanguageConfiguration,
+    ls_config: &LanguageServerConfiguration,
+    doc_path: Option<&std::path::PathBuf>,
+) -> Result<NewClientResult> {
+    let (client, incoming, initialize_notify) = Client::start(
+        &ls_config.command,
+        &ls_config.args,
+        config.config.clone(),
+        ls_config.environment.clone(),
+        &config.roots,
+        id,
+        ls_config.timeout,
+        doc_path,
+    )?;
+
+    let client = Arc::new(client);
+
+    // Initialize the client asynchronously
+    let _client = client.clone();
+    tokio::spawn(async move {
+        use futures_util::TryFutureExt;
+        let value = _client
+            .capabilities
+            .get_or_try_init(|| {
+                _client
+                    .initialize()
+                    .map_ok(|response| response.capabilities)
+            })
+            .await;
+
+        if let Err(e) = value {
+            log::error!("failed to initialize language server: {}", e);
+            return;
+        }
+
+        // next up, notify<initialized>
+        _client
+            .notify::<lsp::notification::Initialized>(lsp::InitializedParams {})
+            .await
+            .unwrap();
+
+        initialize_notify.notify_one();
+    });
+
+    Ok(NewClientResult(client, incoming))
 }
 
 #[cfg(test)]
